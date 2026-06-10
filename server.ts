@@ -4,6 +4,7 @@ import fs from "fs";
 import { execSync } from "child_process";
 import { createServer as createViteServer } from "vite";
 import { PrismaClient } from "@prisma/client";
+import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI, Type } from "@google/genai";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
@@ -15,16 +16,710 @@ const envPath = path.resolve(process.cwd(), ".env");
 if (!fs.existsSync(envPath)) {
   const isCwdApplet = fs.existsSync("/app/applet");
   const dbUrl = isCwdApplet ? "file:/app/applet/prisma/dev.db" : "file:./prisma/dev.db";
-  fs.writeFileSync(
-    envPath,
-    `DATABASE_URL="${dbUrl}"\nJWT_SECRET="EnterpriseModernizationTokenSecretWithEnormousCharacterLength382"\n`
-  );
-  console.log(`[AUTO-CONF] Regenerated missing .env file with database URL: ${dbUrl}`);
+  try {
+    fs.writeFileSync(
+      envPath,
+      `DATABASE_URL="${dbUrl}"\nJWT_SECRET="EnterpriseModernizationTokenSecretWithEnormousCharacterLength382"\n`
+    );
+    console.log(`[AUTO-CONF] Regenerated missing .env file with database URL: ${dbUrl}`);
+  } catch (err: any) {
+    console.warn(`[AUTO-CONF] Could not write .env file automatically (likely a read-only filesystem): ${err.message}`);
+  }
 }
 
 dotenv.config();
 
-const prisma = new PrismaClient();
+const isCwdApplet = fs.existsSync("/app/applet");
+const defaultDbPath = isCwdApplet ? "/app/applet/prisma/dev.db" : path.resolve(process.cwd(), "prisma/dev.db");
+
+let resolvedDbPath = defaultDbPath;
+const tempDbPath = "/tmp/dev.db";
+
+try {
+  // Always use a writeable SQLite path in Cloud Run containers to prevent write errors
+  if (fs.existsSync(defaultDbPath)) {
+    if (!fs.existsSync(tempDbPath)) {
+      fs.copyFileSync(defaultDbPath, tempDbPath);
+      console.log(`[DATABASE-BOOT] Copied SQLite database from ${defaultDbPath} to writable location ${tempDbPath}`);
+    } else {
+      console.log(`[DATABASE-BOOT] Writeable SQLite database already present at ${tempDbPath}`);
+    }
+    resolvedDbPath = tempDbPath;
+  } else {
+    // Fallback directly to /tmp/dev.db
+    resolvedDbPath = tempDbPath;
+  }
+} catch (tempErr: any) {
+  console.warn(`[DATABASE-BOOT WARNING] Failed preparing writeable SQLite DB in /tmp: ${tempErr.message}`);
+}
+
+const dbUrl = process.env.DATABASE_URL || `file:${resolvedDbPath}`;
+// Propagate to env so child processes (like Prisma CLI db push) receive the correct writable DB path
+process.env.DATABASE_URL = dbUrl;
+
+const localPrisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: dbUrl,
+    },
+  },
+});
+
+// Detect real Supabase credentials
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY;
+
+const isSupabaseConfigured = 
+  !!supabaseUrl && 
+  supabaseUrl.startsWith("https://") && 
+  !supabaseUrl.includes("xxxxxxxxxxxx") &&
+  !!supabaseAnonKey &&
+  !supabaseAnonKey.includes("...");
+
+let supabase: any = null;
+if (isSupabaseConfigured) {
+  try {
+    supabase = createClient(supabaseUrl!, supabaseServiceKey || supabaseAnonKey!);
+    console.log("[SUPABASE] Registered backend Supabase storage connection client.");
+  } catch (err: any) {
+    console.error("[SUPABASE ERR] Failed backend user Supabase registry initialization:", err.message);
+  }
+} else {
+  console.log("[SUPABASE WARNING] Supabase variables missing or placeholders detected. Using local SQLite Fallback.");
+}
+
+const useSupabase = () => !!supabase;
+
+// Map helpers for adapter formats
+const mapUserToPrismaFormat = (supabaseUser: any) => {
+  if (!supabaseUser) return null;
+  return {
+    id: supabaseUser.id,
+    email: supabaseUser.email,
+    passwordHash: supabaseUser.password_hash || supabaseUser.passwordHash || supabaseUser.password,
+    name: supabaseUser.name,
+    role: supabaseUser.role || "DEVELOPER",
+    createdAt: new Date(supabaseUser.created_at || supabaseUser.createdAt || Date.now()),
+    updatedAt: new Date(supabaseUser.updated_at || supabaseUser.updatedAt || Date.now())
+  };
+};
+
+const mapBridgeToPrismaFormat = (sbBridge: any, sbOps: any[] = []) => {
+  if (!sbBridge) return null;
+  return {
+    id: sbBridge.id,
+    name: sbBridge.bridge_name || sbBridge.name,
+    description: sbBridge.description || "",
+    wsdlContent: sbBridge.wsdl_content || sbBridge.wsdlContent || "",
+    wsdlUrl: sbBridge.wsdl_url || sbBridge.wsdlUrl || "",
+    soapEndpoint: sbBridge.soap_endpoint || sbBridge.soapEndpoint || "",
+    namespace: sbBridge.namespace_uri || sbBridge.namespace || "",
+    status: sbBridge.status || "DRAFT",
+    userId: sbBridge.created_by || sbBridge.userId || "System",
+    createdAt: new Date(sbBridge.created_at || sbBridge.createdAt || Date.now()),
+    updatedAt: new Date(sbBridge.updated_at || sbBridge.updatedAt || Date.now()),
+    operations: sbOps.map(op => mapOperationToPrismaFormat(op))
+  };
+};
+
+const mapOperationToPrismaFormat = (sbOp: any) => {
+  if (!sbOp) return null;
+  return {
+    id: sbOp.id,
+    bridgeId: sbOp.bridge_id || sbOp.bridgeId,
+    soapAction: sbOp.soap_action || sbOp.soapAction || (sbOp.soap_operation ? `http://legacy.pay.org/auth/${sbOp.soap_operation}` : ""),
+    soapOperation: sbOp.soap_operation || sbOp.soapOperation,
+    restPath: sbOp.rest_path || sbOp.restPath,
+    restMethod: sbOp.http_method || sbOp.restMethod || "POST",
+    inputSchema: typeof sbOp.request_schema === 'object' ? JSON.stringify(sbOp.request_schema) : (sbOp.inputSchema || "{}"),
+    outputSchema: typeof sbOp.response_schema === 'object' ? JSON.stringify(sbOp.response_schema) : (sbOp.outputSchema || "{}"),
+    fieldMappings: typeof sbOp.field_mappings === 'string' ? sbOp.field_mappings : (sbOp.field_mappings ? JSON.stringify(sbOp.field_mappings) : (sbOp.fieldMappings || "[]")),
+    authRequired: sbOp.auth_required !== undefined ? sbOp.auth_required : (sbOp.authRequired !== undefined ? sbOp.authRequired : true),
+    cacheEnabled: sbOp.cache_enabled !== undefined ? sbOp.cache_enabled : (sbOp.cacheEnabled !== undefined ? sbOp.cacheEnabled : false),
+    cacheTtl: sbOp.cache_ttl !== undefined ? sbOp.cache_ttl : (sbOp.cacheTtl !== undefined ? sbOp.cacheTtl : 60),
+    rateLimitRpm: sbOp.rate_limit_rpm !== undefined ? sbOp.rate_limit_rpm : (sbOp.rateLimitRpm !== undefined ? sbOp.rateLimitRpm : 100),
+    createdAt: new Date(sbOp.created_at || sbOp.createdAt || Date.now())
+  };
+};
+
+const mapApiKeyToPrismaFormat = (sbKey: any) => {
+  if (!sbKey) return null;
+  return {
+    id: sbKey.id,
+    key: sbKey.token_hash || sbKey.key,
+    name: sbKey.key_label || sbKey.name,
+    userId: sbKey.revoked_by || sbKey.userId || "System",
+    expiresAt: new Date(sbKey.expires_at || sbKey.expiresAt || Date.now()),
+    isActive: sbKey.is_active !== undefined ? sbKey.is_active : (sbKey.isActive !== undefined ? sbKey.isActive : true),
+    createdAt: new Date(sbKey.created_at || sbKey.createdAt || Date.now())
+  };
+};
+
+const mapLogToPrismaFormat = (sbLog: any) => {
+  if (!sbLog) return null;
+  return {
+    id: sbLog.id,
+    bridgeId: sbLog.bridge_id || sbLog.bridgeId,
+    operationId: sbLog.operation_id || sbLog.operationId || null,
+    userId: sbLog.user_id || sbLog.userId || "System",
+    method: sbLog.http_method || sbLog.method || "POST",
+    path: sbLog.proxy_target_path || sbLog.path,
+    statusCode: sbLog.http_status_code || sbLog.statusCode || 200,
+    latencyMs: sbLog.execution_latency_ms || sbLog.latencyMs || 0,
+    requestBody: typeof sbLog.request_payload === 'object' ? JSON.stringify(sbLog.request_payload) : (sbLog.requestBody || "{}"),
+    responseBody: typeof sbLog.response_payload === 'object' ? JSON.stringify(sbLog.response_payload) : (sbLog.responseBody || "{}"),
+    errorMessage: sbLog.error_message || sbLog.errorMessage || null,
+    ipAddress: sbLog.ip_address || sbLog.ipAddress || "127.0.0.1",
+    createdAt: new Date(sbLog.created_at || sbLog.createdAt || Date.now()),
+    bridge: sbLog.bridge_configurations ? { name: sbLog.bridge_configurations.bridge_name } : (sbLog.bridge ? { name: sbLog.bridge.name } : null)
+  };
+};
+
+const prisma: any = {
+  user: {
+    findUnique: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const email = arg.where?.email;
+          const id = arg.where?.id;
+          let q = supabase.from('users').select('*');
+          if (email) q = q.eq('email', email);
+          if (id) q = q.eq('id', id);
+          const { data, error } = await q.maybeSingle();
+          if (error) throw error;
+          if (data) return mapUserToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE USER ERR] findUnique fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.user.findUnique(arg);
+    },
+    create: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data, error } = await supabase.from('users').insert({
+            name: arg.data.name,
+            email: arg.data.email,
+            password_hash: arg.data.passwordHash,
+            role: arg.data.role || 'DEVELOPER'
+          }).select().single();
+          if (error) throw error;
+          return mapUserToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE USER ERR] create fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.user.create(arg);
+    },
+    update: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const updateData: any = {};
+          if (arg.data.name !== undefined) updateData.name = arg.data.name;
+          if (arg.data.email !== undefined) updateData.email = arg.data.email;
+          if (arg.data.passwordHash !== undefined) updateData.password_hash = arg.data.passwordHash;
+          if (arg.data.role !== undefined) updateData.role = arg.data.role;
+          updateData.updated_at = new Date().toISOString();
+
+          const { data, error } = await supabase.from('users').update(updateData).eq('id', arg.where.id).select().single();
+          if (error) throw error;
+          return mapUserToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE USER ERR] update fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.user.update(arg);
+    },
+    findMany: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data, error } = await supabase.from('users').select('*');
+          if (error) throw error;
+          return (data || []).map(mapUserToPrismaFormat);
+        } catch (err: any) {
+          console.warn("[SUPABASE USER ERR] findMany fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.user.findMany(arg);
+    },
+    delete: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { error } = await supabase.from('users').delete().eq('id', arg.where.id);
+          if (error) throw error;
+          return { id: arg.where.id };
+        } catch (err: any) {
+          console.warn("[SUPABASE USER ERR] delete fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.user.delete(arg);
+    },
+    count: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { count, error } = await supabase.from('users').select('*', { count: 'exact', head: true });
+          if (error) throw error;
+          return count || 0;
+        } catch (err: any) {
+          console.warn("[SUPABASE USER ERR] count fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.user.count(arg);
+    }
+  },
+  bridge: {
+    create: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data, error } = await supabase.from('bridge_configurations').insert({
+            bridge_name: arg.data.name,
+            wsdl_url: arg.data.wsdlUrl || null,
+            description: arg.data.description || null,
+            wsdl_content: arg.data.wsdlContent,
+            soap_endpoint: arg.data.soapEndpoint,
+            namespace_uri: arg.data.namespace,
+            status: arg.data.status || 'DRAFT',
+            created_by: arg.data.userId || 'Enterprise Architect'
+          }).select().single();
+          if (error) throw error;
+          return mapBridgeToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE BRIDGE ERR] create fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.bridge.create(arg);
+    },
+    findUnique: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data: bData, error: bErr } = await supabase.from('bridge_configurations').select('*').eq('id', arg.where.id).maybeSingle();
+          if (bErr) throw bErr;
+          if (!bData) return null;
+          const { data: oData } = await supabase.from('rest_endpoints').select('*').eq('bridge_id', bData.id);
+          return mapBridgeToPrismaFormat(bData, oData || []);
+        } catch (err: any) {
+          console.warn("[SUPABASE BRIDGE ERR] findUnique fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.bridge.findUnique(arg);
+    },
+    findFirst: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          let q = supabase.from('bridge_configurations').select('*');
+          if (arg.where?.id) q = q.eq('id', arg.where.id);
+          if (arg.where?.userId) q = q.eq('created_by', arg.where.userId);
+          const { data: bData, error } = await q.maybeSingle();
+          if (error) throw error;
+          if (!bData) return null;
+          const { data: oData } = await supabase.from('rest_endpoints').select('*').eq('bridge_id', bData.id);
+          return mapBridgeToPrismaFormat(bData, oData || []);
+        } catch (err: any) {
+          console.warn("[SUPABASE BRIDGE ERR] findFirst fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.bridge.findFirst(arg);
+    },
+    findMany: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          let q = supabase.from('bridge_configurations').select('*');
+          if (arg.where?.userId) q = q.eq('created_by', arg.where.userId);
+          const { data: bList, error } = await q;
+          if (error) throw error;
+          if (!bList) return [];
+          
+          const result = [];
+          for (const b of bList) {
+            const { data: oList } = await supabase.from('rest_endpoints').select('*').eq('bridge_id', b.id);
+            const { count } = await supabase.from('transaction_audit_logs').select('*', { count: 'exact', head: true }).eq('bridge_id', b.id);
+            const mapped = mapBridgeToPrismaFormat(b, oList || []);
+            if (mapped) {
+              (mapped as any)._count = { logs: count || 0 };
+              result.push(mapped);
+            }
+          }
+          return result;
+        } catch (err: any) {
+          console.warn("[SUPABASE BRIDGE ERR] findMany fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.bridge.findMany(arg);
+    },
+    update: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const updateData: any = {};
+          if (arg.data.name !== undefined) updateData.bridge_name = arg.data.name;
+          if (arg.data.description !== undefined) updateData.description = arg.data.description;
+          if (arg.data.soapEndpoint !== undefined) updateData.soap_endpoint = arg.data.soapEndpoint;
+          if (arg.data.namespace !== undefined) updateData.namespace_uri = arg.data.namespace;
+          if (arg.data.status !== undefined) updateData.status = arg.data.status;
+          updateData.updated_at = new Date().toISOString();
+
+          const { data: bData, error } = await supabase.from('bridge_configurations').update(updateData).eq('id', arg.where.id).select().single();
+          if (error) throw error;
+          if (!bData) return null;
+
+          if (arg.data.status) {
+            await supabase.from('rest_endpoints').update({ is_active: arg.data.status === 'ACTIVE' }).eq('bridge_id', bData.id);
+          }
+
+          const { data: oData } = await supabase.from('rest_endpoints').select('*').eq('bridge_id', bData.id);
+          return mapBridgeToPrismaFormat(bData, oData || []);
+        } catch (err: any) {
+          console.warn("[SUPABASE BRIDGE ERR] update fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.bridge.update(arg);
+    },
+    delete: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { error } = await supabase.from('bridge_configurations').delete().eq('id', arg.where.id);
+          if (error) throw error;
+          return { id: arg.where.id };
+        } catch (err: any) {
+          console.warn("[SUPABASE BRIDGE ERR] delete fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.bridge.delete(arg);
+    },
+    count: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          let q = supabase.from('bridge_configurations').select('*', { count: 'exact', head: true });
+          if (arg.where?.userId) q = q.eq('created_by', arg.where.userId);
+          const { count, error } = await q;
+          if (error) throw error;
+          return count || 0;
+        } catch (err: any) {
+          console.warn("[SUPABASE BRIDGE ERR] count fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.bridge.count(arg);
+    }
+  },
+  operation: {
+    create: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data, error } = await supabase.from('rest_endpoints').insert({
+            bridge_id: arg.data.bridgeId,
+            soap_operation: arg.data.soapOperation,
+            soap_action: arg.data.soapAction,
+            rest_path: arg.data.restPath,
+            http_method: arg.data.restMethod || 'POST',
+            request_schema: typeof arg.data.inputSchema === 'string' ? JSON.parse(arg.data.inputSchema) : arg.data.inputSchema,
+            response_schema: typeof arg.data.outputSchema === 'string' ? JSON.parse(arg.data.outputSchema) : arg.data.outputSchema,
+            field_mappings: typeof arg.data.fieldMappings === 'string' ? JSON.parse(arg.data.fieldMappings) : arg.data.fieldMappings,
+            auth_required: arg.data.authRequired !== undefined ? arg.data.authRequired : true,
+            cache_enabled: arg.data.cacheEnabled !== undefined ? arg.data.cacheEnabled : false,
+            cache_ttl: arg.data.cacheTtl !== undefined ? Number(arg.data.cacheTtl) : 60,
+            rate_limit_rpm: arg.data.rateLimitRpm !== undefined ? Number(arg.data.rateLimitRpm) : 100
+          }).select().single();
+          if (error) throw error;
+
+          if (arg.data.fieldMappings) {
+            const rawMappings = typeof arg.data.fieldMappings === 'string' ? JSON.parse(arg.data.fieldMappings) : arg.data.fieldMappings;
+            const mappingRows = rawMappings.map((m: any) => ({
+              bridge_id: arg.data.bridgeId,
+              soap_operation: arg.data.soapOperation,
+              rest_field_name: m.restField || m.rest_field_name,
+              soap_field_path: m.soapField || m.soap_field_path,
+              data_type: m.dataType || m.type || 'string',
+              is_required: m.isRequired || m.required || false,
+              ai_generated: true
+            }));
+            await supabase.from('wsdl_field_mappings').insert(mappingRows).catch(()=>{});
+          }
+          return mapOperationToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE OPERATION ERR] create fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.operation.create(arg);
+    },
+    findUnique: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data, error } = await supabase.from('rest_endpoints').select('*').eq('id', arg.where.id).maybeSingle();
+          if (error) throw error;
+          return mapOperationToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE OPERATION ERR] findUnique fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.operation.findUnique(arg);
+    },
+    findFirst: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const id = arg.where?.id;
+          const bridgeId = arg.where?.bridgeId;
+          let q = supabase.from('rest_endpoints').select('*, bridge_configurations(*)');
+          if (id) q = q.eq('id', id);
+          if (bridgeId) q = q.eq('bridge_id', bridgeId);
+          const { data, error } = await q;
+          if (error) throw error;
+          if (!data || data.length === 0) return null;
+          let filtered = data;
+          if (arg.where?.bridge?.userId) {
+            filtered = data.filter(item => item.bridge_configurations?.created_by === arg.where.bridge.userId);
+          }
+          if (filtered.length === 0) return null;
+          return mapOperationToPrismaFormat(filtered[0]);
+        } catch (err: any) {
+          console.warn("[SUPABASE OPERATION ERR] findFirst fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.operation.findFirst(arg);
+    },
+    findMany: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const idIn = arg?.where?.id?.in;
+          const bridgeId = arg?.where?.bridgeId;
+          let q = supabase.from('rest_endpoints').select('*');
+          if (idIn && Array.isArray(idIn)) q = q.in('id', idIn);
+          if (bridgeId) q = q.eq('bridge_id', bridgeId);
+          const { data, error } = await q;
+          if (error) throw error;
+          return (data || []).map(mapOperationToPrismaFormat);
+        } catch (err: any) {
+          console.warn("[SUPABASE OPERATION ERR] findMany fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.operation.findMany(arg);
+    },
+    update: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const updateData: any = {};
+          if (arg.data.restPath !== undefined) updateData.rest_path = arg.data.restPath;
+          if (arg.data.restMethod !== undefined) updateData.http_method = arg.data.restMethod;
+          if (arg.data.inputSchema !== undefined) updateData.request_schema = typeof arg.data.inputSchema === 'string' ? JSON.parse(arg.data.inputSchema) : arg.data.inputSchema;
+          if (arg.data.outputSchema !== undefined) updateData.response_schema = typeof arg.data.outputSchema === 'string' ? JSON.parse(arg.data.outputSchema) : arg.data.outputSchema;
+          if (arg.data.fieldMappings) {
+            updateData.field_mappings = typeof arg.data.fieldMappings === 'string' ? JSON.parse(arg.data.fieldMappings) : arg.data.fieldMappings;
+          }
+          if (arg.data.authRequired !== undefined) updateData.auth_required = arg.data.authRequired;
+          if (arg.data.cacheEnabled !== undefined) updateData.cache_enabled = arg.data.cacheEnabled;
+          if (arg.data.cacheTtl !== undefined) updateData.cache_ttl = Number(arg.data.cacheTtl);
+          if (arg.data.rateLimitRpm !== undefined) updateData.rate_limit_rpm = Number(arg.data.rateLimitRpm);
+
+          const { data, error } = await supabase.from('rest_endpoints').update(updateData).eq('id', arg.where.id).select().single();
+          if (error) throw error;
+          return mapOperationToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE OPERATION ERR] update fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.operation.update(arg);
+    },
+    count: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          let q = supabase.from('rest_endpoints').select('*, bridge_configurations!inner(*)');
+          const userId = arg.where?.bridge?.userId;
+          const status = arg.where?.bridge?.status;
+          if (userId) {
+            q = q.eq('bridge_configurations.created_by', userId);
+          }
+          if (status) {
+            q = q.eq('bridge_configurations.status', status);
+          }
+          const { data, error } = await q;
+          if (error) throw error;
+          return (data || []).length;
+        } catch (err: any) {
+          console.warn("[SUPABASE OPERATION ERR] count fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.operation.count(arg);
+    }
+  },
+  apiKey: {
+    create: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const rawToken = arg.data.key;
+          const maskedToken = rawToken.substring(0, 8) + '••••••••' + rawToken.slice(-4);
+          const { data, error } = await supabase.from('api_keys').insert({
+            key_label: arg.data.name,
+            token_hash: rawToken,
+            token_masked: maskedToken,
+            is_active: true,
+            expires_at: arg.data.expiresAt ? new Date(arg.data.expiresAt).toISOString() : new Date(Date.now() + 365*24*60*60*1000).toISOString(),
+            revoked_by: arg.data.userId
+          }).select().single();
+          if (error) throw error;
+          return mapApiKeyToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE KEY ERR] create fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.apiKey.create(arg);
+    },
+    findMany: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          let q = supabase.from('api_keys').select('*');
+          if (arg.where?.userId) q = q.eq('revoked_by', arg.where.userId);
+          const { data, error } = await q.order('created_at', { ascending: false });
+          if (error) throw error;
+          return (data || []).map(mapApiKeyToPrismaFormat);
+        } catch (err: any) {
+          console.warn("[SUPABASE KEY ERR] findMany fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.apiKey.findMany(arg);
+    },
+    findFirst: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          let q = supabase.from('api_keys').select('*');
+          if (arg.where?.id) q = q.eq('id', arg.where.id);
+          if (arg.where?.userId) q = q.eq('revoked_by', arg.where.userId);
+          const { data, error } = await q.maybeSingle();
+          if (error) throw error;
+          return mapApiKeyToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE KEY ERR] findFirst fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.apiKey.findFirst(arg);
+    },
+    findUnique: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data, error} = await supabase.from('api_keys').select('*').eq('token_hash', arg.where.key).eq('is_active', true).maybeSingle();
+          if (error) throw error;
+          if (!data) return null;
+          const mapped: any = mapApiKeyToPrismaFormat(data);
+          if (mapped) {
+            const { data: uData } = await supabase.from('users').select('*').eq('id', data.revoked_by).maybeSingle();
+            mapped.user = uData ? mapUserToPrismaFormat(uData) : { id: data.revoked_by, name: "System Owner", role: "DEVELOPER" };
+          }
+          return mapped;
+        } catch (err: any) {
+          console.warn("[SUPABASE KEY ERR] findUnique fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.apiKey.findUnique(arg);
+    },
+    update: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const updateData: any = {};
+          if (arg.data.isActive !== undefined) updateData.is_active = arg.data.isActive;
+          const { data, error} = await supabase.from('api_keys').update(updateData).eq('id', arg.where.id).select().single();
+          if (error) throw error;
+          return mapApiKeyToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE KEY ERR] update fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.apiKey.update(arg);
+    },
+    delete: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { error } = await supabase.from('api_keys').delete().eq('id', arg.where.id);
+          if (error) throw error;
+          return { id: arg.where.id };
+        } catch (err: any) {
+          console.warn("[SUPABASE KEY ERR] delete fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.apiKey.delete(arg);
+    }
+  },
+  requestLog: {
+    create: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const { data: bData } = await supabase.from('bridge_configurations').select('bridge_name').eq('id', arg.data.bridgeId).maybeSingle();
+          const bridgeName = bData ? bData.bridge_name : "Legacy Bank Payment Auth";
+          
+          const { data, error } = await supabase.from('transaction_audit_logs').insert({
+            bridge_id: arg.data.bridgeId,
+            bridge_name: bridgeName,
+            http_method: arg.data.method,
+            proxy_target_path: arg.data.path,
+            request_payload: typeof arg.data.requestBody === 'string' ? JSON.parse(arg.data.requestBody) : arg.data.requestBody,
+            response_payload: typeof arg.data.responseBody === 'string' ? JSON.parse(arg.data.responseBody) : arg.data.responseBody,
+            soap_envelope_sent: arg.data.requestBody?.includes('Envelope') ? arg.data.requestBody : null,
+            soap_response_received: arg.data.responseBody?.includes('Envelope') ? arg.data.responseBody : null,
+            http_status_code: arg.data.statusCode,
+            execution_latency_ms: arg.data.latencyMs,
+            error_message: arg.data.errorMessage || null,
+            api_key_used: arg.data.userId || null
+          }).select().single();
+          if (error) throw error;
+          return mapLogToPrismaFormat(data);
+        } catch (err: any) {
+          console.warn("[SUPABASE LOG ERR] create fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.requestLog.create(arg);
+    },
+    count: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const userId = arg.where?.bridge?.userId;
+          let q = supabase.from('transaction_audit_logs').select('*, bridge_configurations!inner(*)', { count: 'exact', head: true });
+          if (userId) {
+            q = q.eq('bridge_configurations.created_by', userId);
+          }
+          if (arg.where?.createdAt?.gte) {
+            q = q.gte('created_at', new Date(arg.where.createdAt.gte).toISOString());
+          }
+          if (arg.where?.statusCode?.gte) {
+            q = q.gte('http_status_code', arg.where.statusCode.gte);
+          }
+          const { count, error } = await q;
+          if (error) throw error;
+          return count || 0;
+        } catch (err: any) {
+          console.warn("[SUPABASE LOG ERR] count fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.requestLog.count(arg);
+    },
+    findMany: async (arg: any) => {
+      if (useSupabase()) {
+        try {
+          const userId = arg.where?.bridge?.userId;
+          let q = supabase.from('transaction_audit_logs').select('*, bridge_configurations!inner(*)');
+          if (userId) {
+            q = q.eq('bridge_configurations.created_by', userId);
+          }
+          if (arg.where?.createdAt?.gte) {
+            q = q.gte('created_at', new Date(arg.where.createdAt.gte).toISOString());
+          }
+          if (arg.orderBy?.createdAt) {
+            q = q.order('created_at', { ascending: arg.orderBy.createdAt === 'asc' });
+          } else {
+            q = q.order('created_at', { ascending: false });
+          }
+          if (arg.take !== undefined) {
+            const rangeStart = arg.skip || 0;
+            const rangeEnd = rangeStart + arg.take - 1;
+            q = q.range(rangeStart, rangeEnd);
+          }
+          const { data, error } = await q;
+          if (error) throw error;
+          return (data || []).map(mapLogToPrismaFormat);
+        } catch (err: any) {
+          console.warn("[SUPABASE LOG ERR] findMany fallback to SQLite:", err.message);
+        }
+      }
+      return localPrisma.requestLog.findMany(arg);
+    }
+  }
+};
 const PORT = 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "EnterpriseModernizationTokenSecretWithEnormousCharacterLength382";
 
@@ -642,7 +1337,7 @@ async function startServer() {
       }
 
       const modelResponse = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: `Map these SOAP fields to REST-friendly camelCase names: [${fields.join(', ')}]. Return a JSON array representation according to schema standards.`,
         config: {
           systemInstruction: "You are an API schema normalizer for enterprise integration. Analyze SOAP field names and return clean REST equivalents. Return ONLY a JSON array. No markdown, no explanation.",
@@ -719,7 +1414,7 @@ async function startServer() {
       }
 
       const modelResponse = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: `Operation: ${operation.soapOperation}. Expected input schema: ${operation.inputSchema}. Actual request: ${JSON.stringify(requestBody)}.`,
         config: {
           systemInstruction: "You are a SOAP/REST API validator. Check if a JSON request body matches the expected schema for a SOAP operation. Return the assessment in JSON format.",
@@ -770,7 +1465,7 @@ async function startServer() {
       }
 
       const modelResponse = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: `Generate a sample JSON request and response for SOAP operation: ${operation.soapOperation}, mapped fields: ${operation.fieldMappings}.`,
         config: {
           systemInstruction: "You are an API documentation assistant. Generate realistic, detailed, sample request and response bodies for REST clients. Return the output in JSON format.",
@@ -1006,10 +1701,16 @@ async function startServer() {
         include: { bridge: { select: { name: true } } }
       });
 
+      const uniqueOpIds = Array.from(new Set(logs.map((l: any) => l.operationId).filter(Boolean)));
+      const operations = uniqueOpIds.length > 0 ? await prisma.operation.findMany({
+        where: { id: { in: uniqueOpIds } }
+      }) : [];
+      const opMap = new Map((operations || []).map((o: any) => [o.id, o]));
+
       const map = new Map<string, { operationName: string; count: number; errors: number }>();
       
       for (const log of logs) {
-        const matchingOp = log.operationId ? await prisma.operation.findUnique({ where: { id: log.operationId } }) : null;
+        const matchingOp = log.operationId ? (opMap.get(log.operationId) as any) : null;
         const name = matchingOp ? matchingOp.soapOperation : `${log.method} ${log.path}`;
         
         const current = map.get(name) || { operationName: name, count: 0, errors: 0 };
@@ -1371,12 +2072,28 @@ async function startServer() {
       legacyPayload[m.soapField] = reqPayload[m.restField];
     });
 
+    const escapeXml = (unsafe: any): string => {
+      if (unsafe === null || unsafe === undefined) return "";
+      if (typeof unsafe !== "string") return String(unsafe);
+      return unsafe.replace(/[<>&'"]/g, (c) => {
+        switch (c) {
+          case "<": return "&lt;";
+          case ">": return "&gt;";
+          case "&": return "&amp;";
+          case "'": return "&apos;";
+          case "\"": return "&quot;";
+          default: return c;
+        }
+      });
+    };
+
     const recursiveObjectToXmlFields = (obj: any): string => {
       let xml = "";
       for (const k in obj) {
         const v = obj[k];
         if (v === undefined || v === null) continue;
-        xml += `<tns:${k}>${typeof v === "object" ? recursiveObjectToXmlFields(v) : v}</tns:${k}>`;
+        const escapedVal = typeof v === "object" ? recursiveObjectToXmlFields(v) : escapeXml(v);
+        xml += `<tns:${k}>${escapedVal}</tns:${k}>`;
       }
       return xml;
     };
