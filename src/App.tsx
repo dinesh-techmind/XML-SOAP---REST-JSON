@@ -507,12 +507,32 @@ export default function App() {
   // Fetch Database Records & Stats (SQLite DB Management)
   const fetchDatabaseRecords = async () => {
     if (!user) return;
+    
+    // RBAC Guard: Developers are not permitted to fetch administrative tables.
+    // We clear database list states and exit gracefully without throwing errors in the UI,
+    // since the yellow warning banner is already displayed to guide them.
+    if (user.role !== "ADMIN") {
+      setDbUsers([]);
+      setDbBridges([]);
+      setDbKeys([]);
+      setDbStats({ usersCount: 0, bridgesCount: 0, keysCount: 0, logsCount: 0 });
+      setDbError("");
+      setDbLoading(false);
+      return;
+    }
+
     setDbLoading(true);
     setDbError("");
     try {
       const resp = await fetch("/api/admin/database/records", {
         headers: { "Authorization": `Bearer ${accessToken}` }
       });
+      
+      const contentType = resp.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        throw new Error(`Server returned non-JSON response (status ${resp.status}). Please check server logs.`);
+      }
+
       const data = await resp.json();
       if (data.success) {
         setDbUsers(data.users || []);
@@ -2241,6 +2261,28 @@ public class SoapBridgeController {
           {/* TAB 7: DATABASE MANAGEMENT DIRECT VIEW PANEL */}
           {activeTab === "db" && (
             <div className="space-y-6 animate-fade-in text-left">
+              {user.role !== "ADMIN" && (
+                <div id="rbac-warning-banner" className="bg-amber-500/10 border border-amber-500/25 p-4 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <h4 className="text-xs font-bold text-amber-400 font-mono flex items-center gap-1.5 uppercase">
+                      <Lock className="h-4 w-4" />
+                      Role-Based Access Control Rule Engaged
+                    </h4>
+                    <p className="text-[11px] text-slate-300 font-mono leading-relaxed max-w-2xl">
+                      You are currently authorized as <span className="font-bold text-white">DEVELOPER ({user.name})</span>. 
+                      An <span className="font-bold text-amber-300">ADMIN</span> role is required to query administrative tables. 
+                      To test administrative commands, log out and sign in using the <span className="text-emerald-400 font-bold">Enterprise Architect</span> sandbox template.
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleLogout}
+                    className="shrink-0 bg-slate-950 hover:bg-slate-900 border border-slate-800 text-amber-400 hover:text-amber-300 px-3 py-1.5 rounded-lg text-[10px] font-mono font-bold transition cursor-pointer"
+                  >
+                    Switch to Admin Profile
+                  </button>
+                </div>
+              )}
+
               <div className="bg-slate-900/50 p-5 rounded-xl border border-slate-800 flex justify-between items-center text-left">
                 <div>
                   <h3 className="text-sm font-bold text-white uppercase tracking-widest font-mono flex items-center gap-1.5">

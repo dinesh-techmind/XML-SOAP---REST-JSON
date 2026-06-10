@@ -122,6 +122,20 @@ async function startServer() {
     }
   };
 
+  const requireAdmin = (req: any, res: any, next: any) => {
+    if (req.user && req.user.role === "ADMIN") {
+      next();
+    } else {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: "AUTH_FORBIDDEN",
+          message: "Privileged access required. This operation is restricted to Administrators.",
+        }
+      });
+    }
+  };
+
   /* =====================================================================================
    * AUTH API ROUTES (PHASE 2)
    * =====================================================================================
@@ -853,7 +867,7 @@ async function startServer() {
    * SYSTEM DATABASE CONTROLLER / DATABASE MANAGEMENT (PHASE 6.5)
    * =====================================================================================
    */
-  app.get("/api/admin/database/records", authenticateJWT, async (req: any, res) => {
+  app.get("/api/admin/database/records", authenticateJWT, requireAdmin, async (req: any, res) => {
     try {
       const users = await prisma.user.findMany({
         select: { id: true, email: true, name: true, role: true, createdAt: true }
@@ -883,7 +897,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/admin/database/users/:id", authenticateJWT, async (req: any, res) => {
+  app.delete("/api/admin/database/users/:id", authenticateJWT, requireAdmin, async (req: any, res) => {
     try {
       if (req.params.id === req.user.id) {
         return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "Cannot delete your active session user account." } });
@@ -1639,16 +1653,23 @@ async function startServer() {
 
     for (const d of usersData) {
       let dbUser = await prisma.user.findUnique({ where: { email: d.email } });
+      const targetRole = d.email === "developer@enterprise.org" ? "ADMIN" : "DEVELOPER";
       if (!dbUser) {
         dbUser = await prisma.user.create({
           data: {
             email: d.email,
             name: d.name,
             passwordHash,
-            role: "DEVELOPER"
+            role: targetRole
           }
         });
-        console.log(`[BOOTSTRAP] Custom user registered: ${dbUser.name} (${dbUser.email})`);
+        console.log(`[BOOTSTRAP] Custom user registered: ${dbUser.name} (${dbUser.email}) as ${targetRole}`);
+      } else if (dbUser.role !== targetRole) {
+        dbUser = await prisma.user.update({
+          where: { id: dbUser.id },
+          data: { role: targetRole }
+        });
+        console.log(`[BOOTSTRAP] Custom user role updated: ${dbUser.name} (${dbUser.email}) to ${targetRole}`);
       }
 
       const bridgeCount = await prisma.bridge.count({ where: { userId: dbUser.id } });
