@@ -1,0 +1,80 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id           String       @id @default(uuid())
+  email        String       @unique
+  passwordHash String
+  name         String
+  role         String       @default("DEVELOPER") // ADMIN, DEVELOPER
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  bridges      Bridge[]
+  apiKeys      ApiKey[]
+}
+
+model Bridge {
+  id           String       @id @default(uuid())
+  name         String
+  description  String?
+  wsdlContent  String
+  wsdlUrl      String?
+  soapEndpoint String
+  namespace    String
+  status       String       @default("ACTIVE") // DRAFT, ACTIVE, INACTIVE
+  userId       String
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  operations   Operation[]
+  logs         RequestLog[]
+}
+
+model Operation {
+  id            String    @id @default(uuid())
+  bridgeId      String
+  bridge        Bridge    @relation(fields: [bridgeId], references: [id], onDelete: Cascade)
+  soapAction    String
+  soapOperation String
+  restPath      String
+  restMethod    String    @default("POST") // GET, POST, PUT, DELETE, PATCH
+  inputSchema   String // JSON stored as string for SQLite compatibility
+  outputSchema  String // JSON stored as string for SQLite compatibility
+  fieldMappings String // JSON stored as string: list of { soapField, restField, confidence, reasoning }
+  authRequired  Boolean   @default(true)
+  cacheEnabled  Boolean   @default(false)
+  cacheTtl      Int       @default(60)
+  rateLimitRpm  Int       @default(100)
+}
+
+model ApiKey {
+  id         String    @id @default(uuid())
+  key        String    @unique
+  name       String
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  isActive   Boolean   @default(true)
+}
+
+model RequestLog {
+  id           String    @id @default(uuid())
+  bridgeId     String
+  bridge       Bridge    @relation(fields: [bridgeId], references: [id], onDelete: Cascade)
+  operationId  String?
+  userId       String?
+  method       String
+  path         String
+  statusCode   Int
+  latencyMs    Int
+  requestBody  String? // JSON stored as string
+  responseBody String? // JSON stored as string
+  errorMessage String?
+  ipAddress    String
+  createdAt    DateTime  @default(now())
+}
