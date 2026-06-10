@@ -53,9 +53,25 @@ try {
   console.warn(`[DATABASE-BOOT WARNING] Failed preparing writeable SQLite DB in /tmp: ${tempErr.message}`);
 }
 
-const dbUrl = process.env.DATABASE_URL || `file:${resolvedDbPath}`;
+let dbUrl = process.env.DATABASE_URL || `file:${resolvedDbPath}`;
+
+// Check if the DATABASE_URL refers to a local file database in the project files
+if (dbUrl.startsWith("file:") && (dbUrl.includes("prisma/dev.db") || dbUrl.includes("file:./") || dbUrl.includes("prisma") || dbUrl === "file:dev.db")) {
+  dbUrl = `file:${resolvedDbPath}`;
+}
+
 // Propagate to env so child processes (like Prisma CLI db push) receive the correct writable DB path
 process.env.DATABASE_URL = dbUrl;
+
+// Ensure writable database permissions on SQLite file
+if (dbUrl.startsWith("file:")) {
+  const filePath = dbUrl.replace("file:", "");
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.chmodSync(filePath, 0o666);
+    }
+  } catch (err) {}
+}
 
 const localPrisma = new PrismaClient({
   datasources: {
