@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import { execSync } from "child_process";
 import { createServer as createViteServer } from "vite";
 import { PrismaClient } from "@prisma/client";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -9,6 +10,17 @@ import bcrypt from "bcryptjs";
 import cookieParser from "cookie-parser";
 import { XMLParser, XMLBuilder } from "fast-xml-parser";
 import dotenv from "dotenv";
+
+const envPath = path.resolve(process.cwd(), ".env");
+if (!fs.existsSync(envPath)) {
+  const isCwdApplet = fs.existsSync("/app/applet");
+  const dbUrl = isCwdApplet ? "file:/app/applet/prisma/dev.db" : "file:./prisma/dev.db";
+  fs.writeFileSync(
+    envPath,
+    `DATABASE_URL="${dbUrl}"\nJWT_SECRET="EnterpriseModernizationTokenSecretWithEnormousCharacterLength382"\n`
+  );
+  console.log(`[AUTO-CONF] Regenerated missing .env file with database URL: ${dbUrl}`);
+}
 
 dotenv.config();
 
@@ -1597,6 +1609,21 @@ async function startServer() {
   // DB Self-healing bootstrap
   try {
     console.log("=== RUNNING GATEWAY SELF-HEALING BOOTSTRAP ===");
+
+    // Quick test to ensure database tables exist (self-healing db schema push on startup)
+    try {
+      await prisma.user.count();
+      console.log("[BOOTSTRAP] Database connection and schema verified.");
+    } catch (dbErr: any) {
+      console.log("[BOOTSTRAP] Database tables missing or schema empty. Attempting auto 'prisma db push'...", dbErr.message);
+      try {
+        execSync("npx prisma db push --accept-data-loss", { stdio: "inherit" });
+        console.log("[BOOTSTRAP] Database schema push succeeded!");
+      } catch (pushErr: any) {
+        console.error("[BOOTSTRAP ERR] Failed running prisma db push:", pushErr);
+      }
+    }
+
     const passwordHash = await bcrypt.hash("EnterprisePass123!", 10);
     const usersData = [
       { email: "developer@enterprise.org", name: "Enterprise Architect" },
